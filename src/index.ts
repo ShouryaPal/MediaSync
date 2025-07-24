@@ -2,18 +2,19 @@
 import express from 'express';
 import http from 'http';
 import { Server as WebSocketServer } from 'ws';
-import mediasoup from 'mediasoup';
+import * as mediasoup from 'mediasoup';
 
 // --- Server setup ---
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
-const PORT = 3000;
+const PORT = 8000;
 
 // --- Mediasoup setup ---
 let worker: mediasoup.types.Worker;
 let router: mediasoup.types.Router;
-let transports: Map<string, mediasoup.types.WebRtcTransport> = new Map();
+// Store both send and recv transports per client
+let transports: Map<string, { send?: mediasoup.types.WebRtcTransport; recv?: mediasoup.types.WebRtcTransport }> = new Map();
 let producers: Map<string, mediasoup.types.Producer> = new Map();
 let consumers: Map<string, mediasoup.types.Consumer[]> = new Map();
 
@@ -60,13 +61,16 @@ wss.on('connection', (ws: import('ws').WebSocket) => {
         break;
       }
       case 'createTransport': {
+        const type: 'send' | 'recv' = msg.data?.type === 'recv' ? 'recv' : 'send';
         const transport = await router.createWebRtcTransport({
           listenIps: [{ ip: '0.0.0.0', announcedIp: undefined }],
           enableUdp: true,
           enableTcp: true,
           preferUdp: true,
         });
-        transports.set(id, transport);
+        let clientTransports = transports.get(id) || {};
+        clientTransports[type] = transport;
+        transports.set(id, clientTransports);
         ws.send(JSON.stringify({
           action: 'transportCreated',
           data: {
@@ -74,28 +78,33 @@ wss.on('connection', (ws: import('ws').WebSocket) => {
             iceParameters: transport.iceParameters,
             iceCandidates: transport.iceCandidates,
             dtlsParameters: transport.dtlsParameters,
+            type,
           },
         }));
         // Handle transport events
         transport.on('dtlsstatechange', (state) => {
           if (state === 'closed') {
             transport.close();
-            transports.delete(id);
+            if (clientTransports[type] === transport) {
+              delete clientTransports[type];
+              transports.set(id, clientTransports);
+            }
           }
         });
         break;
       }
       case 'connectTransport': {
-        const transport = transports.get(id);
-        if (!transport) return;
-        await transport.connect({ dtlsParameters: msg.data.dtlsParameters });
-        ws.send(JSON.stringify({ action: 'transportConnected' }));
+        const type: 'send' | 'recv' = msg.data?.type === 'recv' ? 'recv' : 'send';
+        const clientTransports = transports.get(id);
+        if (!clientTransports || !clientTransports[type]) return;
+        await clientTransports[type]!.connect({ dtlsParameters: msg.data.dtlsParameters });
+        ws.send(JSON.stringify({ action: 'transportConnected', data: { type } }));
         break;
       }
       case 'produce': {
-        const transport = transports.get(id);
-        if (!transport) return;
-        const producer = await transport.produce({
+        const clientTransports = transports.get(id);
+        if (!clientTransports || !clientTransports.send) return;
+        const producer = await clientTransports.send.produce({
           kind: msg.data.kind,
           rtpParameters: msg.data.rtpParameters,
         });
@@ -110,12 +119,12 @@ wss.on('connection', (ws: import('ws').WebSocket) => {
         break;
       }
       case 'consume': {
-        const transport = transports.get(id);
-        if (!transport) return;
+        const clientTransports = transports.get(id);
+        if (!clientTransports || !clientTransports.recv) return;
         const producerId = msg.data.producerId;
         const producer = producers.get(producerId);
         if (!producer) return;
-        const consumer = await transport.consume({
+        const consumer = await clientTransports.recv.consume({
           producerId: producer.id,
           rtpCapabilities: msg.data.rtpCapabilities,
           paused: false,
@@ -148,8 +157,11 @@ wss.on('connection', (ws: import('ws').WebSocket) => {
 
   ws.on('close', () => {
     // Cleanup on disconnect
-    const transport = transports.get(id);
-    if (transport) transport.close();
+    const clientTransports = transports.get(id);
+    if (clientTransports) {
+      if (clientTransports.send) clientTransports.send.close();
+      if (clientTransports.recv) clientTransports.recv.close();
+    }
     transports.delete(id);
     const producer = producers.get(id);
     if (producer) producer.close();
