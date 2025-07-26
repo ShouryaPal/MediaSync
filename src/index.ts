@@ -6,12 +6,16 @@ import * as mediasoup from "mediasoup";
 import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
+import cors from "cors";
 
 // --- Server setup ---
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 const PORT = 8000;
+
+// Enable CORS for all routes and origins
+app.use(cors());
 
 // --- Mediasoup setup ---
 let worker: mediasoup.types.Worker;
