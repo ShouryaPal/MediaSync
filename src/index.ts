@@ -46,34 +46,68 @@ startMediasoup();
 
 // Helper function to create SDP file for FFmpeg
 function createSdpFile(codec: any, payloadType: number, rtpPort: number, rtcpPort: number): string {
-  // Determine codec name for SDP
-  let codecName = 'H264';
+  // Determine if audio or video
+  const mime = codec.mimeType.toLowerCase();
+  let isAudio = mime.includes('audio');
+  let isVideo = mime.includes('video');
+  let codecName = '';
   let fmtp = '';
+  let channels = codec.channels || 2;
 
-  if (codec.mimeType.toLowerCase().includes('vp8')) {
-    codecName = 'VP8';
-  } else if (codec.mimeType.toLowerCase().includes('vp9')) {
-    codecName = 'VP9';
-  } else if (codec.mimeType.toLowerCase().includes('h264')) {
-    codecName = 'H264';
-    // Add H.264 specific parameters
-    if (codec.parameters) {
-      const params = [];
-      if (codec.parameters['packetization-mode']) {
-        params.push(`packetization-mode=${codec.parameters['packetization-mode']}`);
+  if (isAudio) {
+    if (mime.includes('opus')) {
+      codecName = 'OPUS';
+      // OPUS is usually 48000/2
+    } else if (mime.includes('aac')) {
+      codecName = 'MPEG4-GENERIC';
+      // AAC is usually 48000/2
+      // Add AAC fmtp if needed
+      if (codec.parameters) {
+        const params = [];
+        if (codec.parameters['profile-level-id']) {
+          params.push(`profile-level-id=${codec.parameters['profile-level-id']}`);
+        }
+        if (params.length > 0) {
+          fmtp = `a=fmtp:${payloadType} ${params.join(';')}` + '\r\n';
+        }
       }
-      if (codec.parameters['profile-level-id']) {
-        params.push(`profile-level-id=${codec.parameters['profile-level-id']}`);
+    } else {
+      codecName = codec.mimeType.split('/')[1].toUpperCase();
+    }
+  } else if (isVideo) {
+    if (mime.includes('vp8')) {
+      codecName = 'VP8';
+    } else if (mime.includes('vp9')) {
+      codecName = 'VP9';
+    } else if (mime.includes('h264')) {
+      codecName = 'H264';
+      // Add H.264 specific parameters
+      if (codec.parameters) {
+        const params = [];
+        if (codec.parameters['packetization-mode']) {
+          params.push(`packetization-mode=${codec.parameters['packetization-mode']}`);
+        }
+        if (codec.parameters['profile-level-id']) {
+          params.push(`profile-level-id=${codec.parameters['profile-level-id']}`);
+        }
+        if (params.length > 0) {
+          fmtp = `a=fmtp:${payloadType} ${params.join(';')}` + '\r\n';
+        }
       }
-      if (params.length > 0) {
-        fmtp = `a=fmtp:${payloadType} ${params.join(';')}` + '\r\n';
-      }
+    } else {
+      codecName = codec.mimeType.split('/')[1].toUpperCase();
     }
   }
 
-  const sdpContent = `v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=mediasoup\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video ${rtpPort} RTP/AVP ${payloadType}\r\na=rtpmap:${payloadType} ${codecName}/${codec.clockRate}\r\n${fmtp}a=sendonly\r\na=rtcp:${rtcpPort}\r\n`;
+  let mline = '';
+  if (isAudio) {
+    mline = `m=audio ${rtpPort} RTP/AVP ${payloadType}\r\na=rtpmap:${payloadType} ${codecName}/${codec.clockRate}/${channels}\r\n`;
+  } else if (isVideo) {
+    mline = `m=video ${rtpPort} RTP/AVP ${payloadType}\r\na=rtpmap:${payloadType} ${codecName}/${codec.clockRate}\r\n`;
+  }
 
-  return sdpContent;
+  // Compose SDP section
+  return `v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=mediasoup\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n${mline}${fmtp}a=sendonly\r\na=rtcp:${rtcpPort}\r\n`;
 }
 
 // --- WebSocket signaling ---

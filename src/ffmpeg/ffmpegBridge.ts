@@ -152,9 +152,9 @@ export async function setupHlsFfmpegBridge({
     }
     ffmpegArgs.push(
       "-f", "hls",
-      "-hls_time", "2",
-      "-hls_list_size", "5",
-      "-hls_flags", "delete_segments+append_list",
+      "-hls_time", "1",
+      "-hls_list_size", "3",
+      "-hls_flags", "delete_segments+append_list+program_date_time+split_by_time",
       "-hls_segment_filename", path.join(hlsDir, "segment_%03d.ts"),
       path.join(hlsDir, "playlist.m3u8")
     );
