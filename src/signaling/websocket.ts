@@ -5,6 +5,12 @@ import path from "path";
 import fs from "fs";
 import { spawn } from "child_process";
 import { setupHlsFfmpegBridge } from "../ffmpeg/ffmpegBridge";
+import { 
+  setupCompositeHlsFfmpegBridge, 
+  addProducerToComposite, 
+  removeProducerFromComposite,
+  getCompositeSessionInfo 
+} from "../ffmpeg/compositeFFmpegBridge";
 
 export function setupWebSocketSignaling(server: any, {
   transports,
@@ -27,6 +33,9 @@ export function setupWebSocketSignaling(server: any, {
 
   // Track both audio and video producers per client
   const clientProducers: Map<string, { video?: mediasoup.types.Producer, audio?: mediasoup.types.Producer }> = new Map();
+  
+  // Track composite stream mode
+  let compositeMode = false;
 
   wss.on("connection", (ws: import("ws").WebSocket) => {
     const id = Math.random().toString(36).substr(2, 9);
@@ -68,6 +77,73 @@ export function setupWebSocketSignaling(server: any, {
           }, 2000);
           break;
         }
+
+        case "enableCompositeMode": {
+          compositeMode = true;
+          await setupCompositeHlsFfmpegBridge({
+            getRouter,
+            producerResources,
+            createSdpFile,
+          });
+          
+          // Add all existing producers to composite
+          for (const [producerId, producer] of producers.entries()) {
+            const clientId = producerToClient.get(producerId);
+            if (clientId) {
+              await addProducerToComposite({
+                producer,
+                clientId,
+                getRouter,
+              });
+            }
+          }
+          
+          ws.send(JSON.stringify({ 
+            action: "compositeModeEnabled",
+            data: getCompositeSessionInfo()
+          }));
+          
+          // Notify all clients about composite mode
+          wss.clients.forEach((client) => {
+            if ((client as import("ws").WebSocket).readyState === 1) {
+              (client as import("ws").WebSocket).send(
+                JSON.stringify({
+                  action: "compositeModeUpdate",
+                  data: { enabled: true, info: getCompositeSessionInfo() },
+                }),
+              );
+            }
+          });
+          break;
+        }
+
+        case "disableCompositeMode": {
+          compositeMode = false;
+          // You might want to implement cleanup here
+          ws.send(JSON.stringify({ action: "compositeModeDisabled" }));
+          
+          // Notify all clients
+          wss.clients.forEach((client) => {
+            if ((client as import("ws").WebSocket).readyState === 1) {
+              (client as import("ws").WebSocket).send(
+                JSON.stringify({
+                  action: "compositeModeUpdate",
+                  data: { enabled: false },
+                }),
+              );
+            }
+          });
+          break;
+        }
+
+        case "getCompositeInfo": {
+          ws.send(JSON.stringify({
+            action: "compositeInfo",
+            data: getCompositeSessionInfo()
+          }));
+          break;
+        }
+
         case "createTransport": {
           const type: "send" | "recv" =
             msg.data?.type === "recv" ? "recv" : "send";
@@ -103,6 +179,7 @@ export function setupWebSocketSignaling(server: any, {
           });
           break;
         }
+
         case "connectTransport": {
           const type: "send" | "recv" =
             msg.data?.type === "recv" ? "recv" : "send";
@@ -116,6 +193,7 @@ export function setupWebSocketSignaling(server: any, {
           );
           break;
         }
+
         case "produce": {
           const clientTransports = transports.get(id);
           if (!clientTransports || !clientTransports.send) return;
@@ -133,52 +211,98 @@ export function setupWebSocketSignaling(server: any, {
           if (msg.data.kind === "audio") entry.audio = producer;
           clientProducers.set(id, entry);
 
-          // If either audio or video is produced, try to start HLS/FFmpeg bridge
-          if (entry.video || entry.audio) {
-            // Use video producer ID as session ID if present, else audio
-            try {
-              await setupHlsFfmpegBridge({
-                videoProducer: entry.video || null,
-                audioProducer: entry.audio || null,
-                getRouter,
-                producerResources,
-                createSdpFile
-              });
-            } catch (error) {}
+          // If composite mode is enabled, add to composite stream
+          if (compositeMode) {
+            await addProducerToComposite({
+              producer,
+              clientId: id,
+              getRouter,
+            });
+            
+            // Notify all clients about composite update
+            wss.clients.forEach((client) => {
+              if ((client as import("ws").WebSocket).readyState === 1) {
+                (client as import("ws").WebSocket).send(
+                  JSON.stringify({
+                    action: "compositeUpdate",
+                    data: getCompositeSessionInfo(),
+                  }),
+                );
+              }
+            });
+          } else {
+            // Original individual stream logic
+            if (entry.video || entry.audio) {
+              try {
+                await setupHlsFfmpegBridge({
+                  videoProducer: entry.video || null,
+                  audioProducer: entry.audio || null,
+                  getRouter,
+                  producerResources,
+                  createSdpFile
+                });
+              } catch (error) {
+                console.error("Error setting up individual HLS bridge:", error);
+              }
+            }
           }
 
           producer.on("transportclose", () => {
             producers.delete(producer.id);
             producerToClient.delete(producer.id);
             producerKinds.delete(producer.id);
+            
             // Remove from clientProducers
             let entry = clientProducers.get(id) || {};
             if (msg.data.kind === "video") delete entry.video;
             if (msg.data.kind === "audio") delete entry.audio;
             clientProducers.set(id, entry);
+
+            // Remove from composite if in composite mode
+            if (compositeMode) {
+              removeProducerFromComposite(producer.id);
+              
+              // Notify all clients about composite update
+              wss.clients.forEach((client) => {
+                if ((client as import("ws").WebSocket).readyState === 1) {
+                  (client as import("ws").WebSocket).send(
+                    JSON.stringify({
+                      action: "compositeUpdate",
+                      data: getCompositeSessionInfo(),
+                    }),
+                  );
+                }
+              });
+            }
           });
+
           ws.send(
             JSON.stringify({ action: "produced", data: { id: producer.id } }),
           );
-          wss.clients.forEach((client) => {
-            if (
-              client !== ws &&
-              (client as import("ws").WebSocket).readyState === 1
-            ) {
-              (client as import("ws").WebSocket).send(
-                JSON.stringify({
-                  action: "newProducer",
-                  data: {
-                    id: producer.id,
-                    clientId: id,
-                    kind: msg.data.kind,
-                  },
-                }),
-              );
-            }
-          });
+
+          // Notify other clients about new producer (only if not in composite mode)
+          if (!compositeMode) {
+            wss.clients.forEach((client) => {
+              if (
+                client !== ws &&
+                (client as import("ws").WebSocket).readyState === 1
+              ) {
+                (client as import("ws").WebSocket).send(
+                  JSON.stringify({
+                    action: "newProducer",
+                    data: {
+                      id: producer.id,
+                      clientId: id,
+                      kind: msg.data.kind,
+                    },
+                  }),
+                );
+              }
+            });
+          }
           break;
         }
+
         case "consume": {
           const clientTransports = transports.get(id);
           if (!clientTransports || !clientTransports.recv) return;
@@ -232,6 +356,7 @@ export function setupWebSocketSignaling(server: any, {
           );
           break;
         }
+
         case "resume": {
           const consumerId = msg.data?.consumerId;
           if (consumerId) {
@@ -249,6 +374,7 @@ export function setupWebSocketSignaling(server: any, {
           ws.send(JSON.stringify({ action: "resumed" }));
           break;
         }
+
         default:
           ws.send(JSON.stringify({ error: "Unknown action" }));
       }
@@ -261,15 +387,24 @@ export function setupWebSocketSignaling(server: any, {
         if (clientTransports.recv) clientTransports.recv.close();
       }
       transports.delete(id);
+
+      // Clean up producers and remove from composite if needed
       for (const [producerId, clientId] of producerToClient.entries()) {
         if (clientId === id) {
           const producer = producers.get(producerId);
           if (producer) {
+            // Remove from composite if in composite mode
+            if (compositeMode) {
+              removeProducerFromComposite(producerId);
+            }
+            
             producer.close();
           }
           producers.delete(producerId);
           producerToClient.delete(producerId);
           producerKinds.delete(producerId);
+          
+          // Clean individual producer resources if they exist
           if (producerResources.has(producerId)) {
             const { ffmpeg, transports, consumers, updateLivePlaylist } = producerResources.get(producerId)!;
             ffmpeg.kill("SIGTERM");
@@ -278,6 +413,8 @@ export function setupWebSocketSignaling(server: any, {
             transports.forEach(t => t.close());
             producerResources.delete(producerId);
           }
+          
+          // Notify other clients
           wss.clients.forEach((client) => {
             if ((client as import("ws").WebSocket).readyState === 1) {
               (client as import("ws").WebSocket).send(
@@ -290,9 +427,28 @@ export function setupWebSocketSignaling(server: any, {
           });
         }
       }
+
+      // Update composite info if in composite mode
+      if (compositeMode) {
+        wss.clients.forEach((client) => {
+          if ((client as import("ws").WebSocket).readyState === 1) {
+            (client as import("ws").WebSocket).send(
+              JSON.stringify({
+                action: "compositeUpdate",
+                data: getCompositeSessionInfo(),
+              }),
+            );
+          }
+        });
+      }
+
+      // Clean up client consumers
       const consumerList = consumers.get(id) || [];
       for (const consumer of consumerList) consumer.close();
       consumers.delete(id);
+      
+      // Remove from client producers tracking
+      clientProducers.delete(id);
     });
   });
-} 
+}
