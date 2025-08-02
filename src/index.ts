@@ -25,7 +25,6 @@ let producers: Map<string, mediasoup.types.Producer> = new Map();
 let consumers: Map<string, mediasoup.types.Consumer[]> = new Map();
 
 let producerToClient: Map<string, string> = new Map();
-
 let producerKinds: Map<string, "audio" | "video"> = new Map();
 
 const producerResources: Map<
@@ -40,7 +39,7 @@ const producerResources: Map<
 
 startMediasoup();
 
-function createSdpFile(
+export function createSdpFile(
   codec: any,
   payloadType: number,
   rtpPort: number,
@@ -126,16 +125,15 @@ app.get("/", (req: express.Request, res: express.Response) => {
   res.send("Mediasoup SFU server running");
 });
 
-app.use("/hls", (req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept",
-  );
-  next();
-});
-
-app.use("/hls", express.static("hls"));
+app.use("/hls", express.static("hls", {
+  setHeaders: (res, path, stat) => {
+    if (path.endsWith('.m3u8')) {
+      res.header('Content-Type', 'application/x-mpegURL');
+    } else if (path.endsWith('.ts')) {
+      res.header('Content-Type', 'video/MP2T');
+    }
+  },
+}));
 
 app.get("/debug/hls", (req, res) => {
   type HlsStatus = {
@@ -144,6 +142,7 @@ app.get("/debug/hls", (req, res) => {
     hlsDirectories: string[];
     livePlaylistExists: boolean;
     liveSegments: string[];
+    combinedStreamExists: boolean;
     error?: string;
   };
 
@@ -153,6 +152,7 @@ app.get("/debug/hls", (req, res) => {
     hlsDirectories: [],
     livePlaylistExists: false,
     liveSegments: [],
+    combinedStreamExists: false,
   };
 
   try {
@@ -170,6 +170,11 @@ app.get("/debug/hls", (req, res) => {
         .readdirSync(liveDir)
         .filter((f) => f.endsWith(".ts"));
     }
+
+    // Check if combined stream exists
+    const combinedDir = path.join(process.cwd(), "hls", "combined");
+    const combinedPlaylist = path.join(combinedDir, "playlist.m3u8");
+    hlsStatus.combinedStreamExists = fs.existsSync(combinedPlaylist);
   } catch (error: any) {
     hlsStatus.error = error?.message || String(error);
   }
@@ -181,12 +186,33 @@ app.get("/api/active-producers", (req, res) => {
   const videoProducers = Array.from(producers.entries())
     .filter(([id]) => producerKinds.get(id) === "video")
     .map(([id]) => id);
-  res.json({ producers: videoProducers });
+  res.json({
+    producers: videoProducers,
+    hasCombinedStream: producerResources.has("combined-stream"),
+  });
+});
+
+// New endpoint to check if combined stream is available
+app.get("/api/combined-stream-status", (req, res) => {
+  const combinedDir = path.join(process.cwd(), "hls", "combined");
+  const combinedPlaylist = path.join(combinedDir, "playlist.m3u8");
+  const liveDir = path.join(process.cwd(), "hls", "live");
+  const livePlaylist = path.join(liveDir, "playlist.m3u8");
+
+  res.json({
+    combinedAvailable: fs.existsSync(combinedPlaylist),
+    liveAvailable: fs.existsSync(livePlaylist),
+    activeVideoProducers: Array.from(producers.entries()).filter(
+      ([id]) => producerKinds.get(id) === "video",
+    ).length,
+    ffmpegRunning: producerResources.has("combined-stream"),
+  });
 });
 
 server.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
   console.log(
-    `HLS streams available at http://localhost:${PORT}/hls/live/playlist.m3u8`,
+    `Combined HLS stream available at http://localhost:${PORT}/hls/combined/playlist.m3u8`,
   );
+  console.log(`Debug endpoint available at http://localhost:${PORT}/debug/hls`);
 });
